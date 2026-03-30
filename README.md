@@ -19,9 +19,6 @@ Sistema de monitoramento de preços de hardware em e-commerces brasileiros. Cole
                               [Discord Webhook]
 ```
 
-**3 containers Docker** (mês 1-3): PostgreSQL, Scraper, Pipeline ML.
-
-**+2 containers** (mês 4-5): FastAPI (deploy do modelo) e Bot Discord (interface de consulta).
 
 ## Stack
 
