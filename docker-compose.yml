@@ -1,0 +1,32 @@
+# define os serviços (containers) do projeto
+services:
+
+  # serviço do banco de dados
+  db:
+    image: postgres:16                      # usa a imagem oficial do PostgreSQL versão 16
+    container_name: pricemonitor-db         # nome fixo do container (pra facilitar docker exec)
+    env_file: .env                          # carrega variáveis do .env (user, password, db name)
+    ports:
+      - "5432:5432"                         # porta_host:porta_container — expõe pra acessar de fora
+    volumes:
+      - pgdata:/var/lib/postgresql/data                        # volume nomeado: dados do banco persistem entre restarts
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql     # monta o schema no diretório que o Postgres executa na primeira subida
+    healthcheck:                            # verifica se o banco tá pronto pra receber conexão
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]  # comando que checa se o Postgres tá aceitando conexões
+      interval: 5s                          # checa a cada 5 segundos
+      timeout: 3s                           # se demorar mais que 3s, considera falha
+      retries: 5                            # depois de 5 falhas seguidas, marca como unhealthy
+
+  # serviço do scraper
+  scraper:
+    build: ./scraper                        # builda a imagem a partir do Dockerfile em ./scraper
+    container_name: pricemonitor-scraper
+    env_file: .env                          # mesmas variáveis do banco (pra conectar) + config do scraper
+    depends_on:
+      db:
+        condition: service_healthy           # só sobe o scraper quando o banco estiver healthy
+    restart: unless-stopped                  # se o scraper crashar, reinicia automaticamente
+
+# volumes nomeados — ficam gerenciados pelo Docker, não somem com docker compose down
+volumes:
+  pgdata:
