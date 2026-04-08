@@ -14,8 +14,23 @@ logging.basicConfig(
 )
 log = logging.getLogger("discord-bot")
 
-WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 MODELS_DIR = "/app/models"
+
+# Carrega canais do .env
+CANAIS = []
+for prefix in ["APPLE", "BELEZA"]:
+    webhook = os.getenv(f"WEBHOOK_{prefix}", "")
+    cargo = os.getenv(f"CARGO_{prefix}", "")
+    categorias = os.getenv(f"CATEGORIES_{prefix}", "")
+    if webhook and "COLE_O_WEBHOOK" not in webhook:
+        CANAIS.append({
+            "nome": prefix.lower(),
+            "webhook": webhook,
+            "cargo": cargo,
+            "categorias": [c.strip() for c in categorias.split(",") if c.strip()],
+        })
+
+log.info("Canais configurados: %s", [c["nome"] for c in CANAIS])
 
 
 def get_insight(slug, preco_atual):
@@ -62,10 +77,9 @@ def conectar():
     )
 
 
-def enviar_webhook(embeds):
-    """Envia uma mensagem com embeds para o webhook do Discord."""
-    if not WEBHOOK_URL or "your/webhook" in WEBHOOK_URL:
-        log.warning("DISCORD_WEBHOOK_URL não configurado, pulando envio")
+def enviar_webhook(webhook_url, embeds, cargo_id=None):
+    """Envia embeds pro webhook do Discord, marcando o cargo se configurado."""
+    if not webhook_url:
         return
 
     payload = {
@@ -73,8 +87,12 @@ def enviar_webhook(embeds):
         "embeds": embeds,
     }
 
+    # Marca o cargo na mensagem
+    if cargo_id:
+        payload["content"] = f"<@&{cargo_id}>"
+
     try:
-        resp = requests.post(WEBHOOK_URL, json=payload, timeout=10)
+        resp = requests.post(webhook_url, json=payload, timeout=10)
         resp.raise_for_status()
         log.info("Webhook enviado com sucesso")
     except Exception as e:
@@ -122,18 +140,77 @@ def montar_embed(a):
     }
 
 
+def encontrar_canal(category):
+    """Encontra qual canal deve receber alertas dessa categoria."""
+    for canal in CANAIS:
+        if category in canal["categorias"]:
+            return canal
+    return None
+
+
+def montar_embed_oferta(produto):
+    """Monta embed pra melhor oferta (categorias sem anomalias, ex: wella-oil)."""
+    preco = float(produto["min_price"])
+    media = float(produto["avg_price"])
+    desconto = round((preco - media) / media * 100, 1) if media > 0 else 0
+
+    fields = [
+        {"name": "Menor preço", "value": fmt_preco(preco), "inline": True},
+        {"name": "Média mercado", "value": fmt_preco(media), "inline": True},
+        {"name": "Diferença", "value": f"{desconto}%", "inline": True},
+        {"name": "Lojas", "value": str(produto["num_stores"]), "inline": True},
+    ]
+
+    insight = get_insight(produto.get("slug", ""), media)
+    if insight:
+        fields.append({"name": "Previsão", "value": insight, "inline": False})
+
+    return {
+        "title": f"🛒 {produto['title'][:80]}",
+        "url": produto.get("permalink", ""),
+        "color": 3066993,  # Verde
+        "fields": fields,
+        "thumbnail": {"url": produto.get("thumbnail", "")},
+    }
+
+
+def buscar_melhores_ofertas(conn, categorias):
+    """Busca a melhor oferta de cada produto nas categorias sem anomalias."""
+    if not categorias:
+        return []
+
+    placeholders = ",".join(["%s"] * len(categorias))
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(f"""
+                SELECT DISTINCT ON (p.id)
+                    p.title, p.slug, p.permalink, p.thumbnail, p.category,
+                    ph.price as min_price, ph.avg_price, ph.num_stores
+                FROM price_history ph
+                JOIN products p ON p.id = ph.product_id
+                WHERE p.category IN ({placeholders})
+                ORDER BY p.id, ph.collected_at DESC, ph.price ASC
+            """, categorias)
+            return cur.fetchall()
+    except Exception as e:
+        log.warning("Erro ao buscar melhores ofertas: %s", e)
+        return []
+
+
 def alerta_anomalias():
-    """Busca TODAS as anomalias não notificadas e envia em lotes no Discord."""
+    """Busca anomalias não notificadas e envia pro canal certo baseado na categoria."""
     conn = conectar()
 
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # DISTINCT ON (product_id) pega só a melhor oferta por produto
             cur.execute("""
-                SELECT a.*, p.permalink, p.thumbnail, p.slug
+                SELECT DISTINCT ON (a.product_id)
+                    a.*, p.permalink, p.thumbnail, p.slug, p.category
                 FROM anomalies a
                 JOIN products p ON p.id = a.product_id
                 WHERE a.notified = FALSE
-                ORDER BY a.discount_pct ASC
+                ORDER BY a.product_id, a.discount_pct ASC
             """)
             anomalias = cur.fetchall()
     except Exception as e:
@@ -141,43 +218,80 @@ def alerta_anomalias():
         conn.close()
         return False
 
-    if not anomalias:
-        log.info("Nenhuma anomalia nova para alertar")
+    # Agrupa anomalias por canal
+    por_canal = {}
+    categorias_com_anomalia = set()
+    for a in anomalias:
+        canal = encontrar_canal(a.get("category", ""))
+        if not canal:
+            continue
+        categorias_com_anomalia.add(a["category"])
+        nome = canal["nome"]
+        if nome not in por_canal:
+            por_canal[nome] = {"canal": canal, "embeds": []}
+        por_canal[nome]["embeds"].append(montar_embed(a))
+
+    # Pra canais que não tiveram anomalias, envia melhores ofertas
+    for canal in CANAIS:
+        cats_sem_anomalia = [c for c in canal["categorias"] if c not in categorias_com_anomalia]
+        if cats_sem_anomalia:
+            ofertas = buscar_melhores_ofertas(conn, cats_sem_anomalia)
+            if ofertas:
+                nome = canal["nome"]
+                if nome not in por_canal:
+                    por_canal[nome] = {"canal": canal, "embeds": []}
+                enviadas = 0
+                for o in ofertas:
+                    # Só envia se tem diferença real (min_price < avg_price)
+                    min_p = float(o["min_price"])
+                    avg_p = float(o["avg_price"])
+                    if avg_p > 0 and min_p < avg_p * 0.97:  # pelo menos 3% abaixo
+                        por_canal[nome]["embeds"].append(montar_embed_oferta(o))
+                        enviadas += 1
+                if enviadas:
+                    log.info("Canal %s: %d melhores ofertas (sem anomalias)", nome, enviadas)
+
+    if not por_canal:
+        log.info("Nenhuma anomalia ou oferta para alertar")
         conn.close()
         return False
 
-    # Monta todos os embeds
-    embeds = [montar_embed(a) for a in anomalias]
-
-    # Envia em lotes de 5 (limite do Discord por mensagem)
+    # Envia pra cada canal em lotes de 5
     total_enviado = 0
-    for i in range(0, len(embeds), 5):
-        lote = embeds[i:i + 5]
-        enviar_webhook(lote)
-        total_enviado += len(lote)
-        if i + 5 < len(embeds):
-            time.sleep(2)  # delay entre lotes pra não bater rate limit
+    for nome, dados in por_canal.items():
+        canal = dados["canal"]
+        embeds = dados["embeds"]
 
-    # Marca TODAS como notificadas
-    try:
-        with conn.cursor() as cur:
-            ids = [a["id"] for a in anomalias]
-            cur.execute(
-                "UPDATE anomalies SET notified = TRUE WHERE id = ANY(%s)",
-                (ids,),
-            )
-        conn.commit()
-    except Exception as e:
-        log.warning("Erro ao marcar notificadas: %s", e)
-    finally:
-        conn.close()
+        for i in range(0, len(embeds), 5):
+            lote = embeds[i:i + 5]
+            cargo = canal["cargo"] if i == 0 else None
+            enviar_webhook(canal["webhook"], lote, cargo)
+            total_enviado += len(lote)
+            if i + 5 < len(embeds):
+                time.sleep(2)
 
-    log.info("Alertas enviados: %d anomalias em %d mensagens", total_enviado, (len(embeds) + 4) // 5)
+        log.info("Canal %s: %d alertas enviados", nome, len(embeds))
+
+    # Marca anomalias como notificadas
+    if anomalias:
+        try:
+            with conn.cursor() as cur:
+                ids = [a["id"] for a in anomalias]
+                cur.execute(
+                    "UPDATE anomalies SET notified = TRUE WHERE id = ANY(%s)",
+                    (ids,),
+                )
+            conn.commit()
+        except Exception as e:
+            log.warning("Erro ao marcar notificadas: %s", e)
+
+    conn.close()
+    log.info("Alertas enviados: %d total", total_enviado)
     return True
 
 
 def resumo_diario():
-    """Envia um resumo diário no Discord."""
+    """Envia um resumo diário em TODOS os canais configurados."""
     conn = conectar()
 
     try:
@@ -193,22 +307,10 @@ def resumo_diario():
 
             cur.execute("SELECT COUNT(*) as total FROM anomalies")
             total_anomalias = cur.fetchone()["total"]
-
-            # Top 5 maiores descontos ativos
-            cur.execute("""
-                SELECT title, store_name, price, avg_price, discount_pct
-                FROM anomalias
-                ORDER BY discount_pct ASC
-                LIMIT 5
-            """)
-            top_descontos = cur.fetchall()
     except Exception as e:
         log.warning("Erro no resumo: %s", e)
-        # Tenta query simplificada se anomalias não existe
-        try:
-            top_descontos = []
-        except:
-            pass
+        conn.close()
+        return
     finally:
         conn.close()
 
@@ -222,18 +324,10 @@ def resumo_diario():
         ],
     }
 
-    if top_descontos:
-        desc_text = ""
-        for d in top_descontos:
-            desc_text += f"• {d['title'][:40]}: {fmt_preco(float(d['price']))} ({round(float(d['discount_pct']), 1)}%)\n"
-        embed["fields"].append({
-            "name": "Top descontos",
-            "value": desc_text[:1024],
-            "inline": False,
-        })
+    for canal in CANAIS:
+        enviar_webhook(canal["webhook"], [embed])
 
-    enviar_webhook([embed])
-    log.info("Resumo diário enviado")
+    log.info("Resumo diário enviado em %d canais", len(CANAIS))
 
 
 def main():
@@ -242,7 +336,6 @@ def main():
     log.info("Aguardando 45 min para scraper + ML processarem...")
     time.sleep(2700)
 
-    # Tenta enviar alertas. Se não tiver, retry 1x depois de 5 min
     enviou = alerta_anomalias()
     if not enviou:
         log.info("Sem anomalias. Retry em 5 min...")
