@@ -23,6 +23,17 @@ CREATE TABLE IF NOT EXISTS price_history (
     collected_at TIMESTAMP DEFAULT NOW()    -- quando o scraper coletou esse dado
 );
 
+-- Tabela de anomalias: preços anômalos detectados pelo pipeline ML
+CREATE TABLE IF NOT EXISTS anomalies (
+    id SERIAL PRIMARY KEY,
+    product_id INTEGER REFERENCES products(id),
+    ml_id VARCHAR(20),
+    title VARCHAR(500),
+    price NUMERIC(12,2),
+    anomaly_score FLOAT,
+    detected_at TIMESTAMP DEFAULT NOW()
+);
+
 -- Índices pra consultas que vão ser frequentes no ML pipeline
 CREATE INDEX idx_price_history_product_id ON price_history(product_id);
 CREATE INDEX idx_price_history_collected_at ON price_history(collected_at);

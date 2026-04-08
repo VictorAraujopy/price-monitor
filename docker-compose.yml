@@ -1,32 +1,62 @@
-# define os serviços (containers) do projeto
 services:
 
-  # serviço do banco de dados
   db:
-    image: postgres:16                      # usa a imagem oficial do PostgreSQL versão 16
-    container_name: pricemonitor-db         # nome fixo do container (pra facilitar docker exec)
-    env_file: .env                          # carrega variáveis do .env (user, password, db name)
+    image: postgres:16
+    container_name: pricemonitor-db
+    env_file: .env
     ports:
-      - "5432:5432"                         # porta_host:porta_container — expõe pra acessar de fora
+      - "5432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data                        # volume nomeado: dados do banco persistem entre restarts
-      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql     # monta o schema no diretório que o Postgres executa na primeira subida
-    healthcheck:                            # verifica se o banco tá pronto pra receber conexão
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]  # comando que checa se o Postgres tá aceitando conexões
-      interval: 5s                          # checa a cada 5 segundos
-      timeout: 3s                           # se demorar mais que 3s, considera falha
-      retries: 5                            # depois de 5 falhas seguidas, marca como unhealthy
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
-  # serviço do scraper
   scraper:
-    build: ./scraper                        # builda a imagem a partir do Dockerfile em ./scraper
+    build: ./scraper
     container_name: pricemonitor-scraper
-    env_file: .env                          # mesmas variáveis do banco (pra conectar) + config do scraper
+    env_file: .env
     depends_on:
       db:
-        condition: service_healthy           # só sobe o scraper quando o banco estiver healthy
-    restart: unless-stopped                  # se o scraper crashar, reinicia automaticamente
+        condition: service_healthy
+    restart: unless-stopped
 
-# volumes nomeados — ficam gerenciados pelo Docker, não somem com docker compose down
+  ml:
+    build: ./ml
+    container_name: pricemonitor-ml
+    env_file: .env
+    volumes:
+      - ml-models:/app/models
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  api:
+    build: ./api
+    container_name: pricemonitor-api
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ml-models:/app/models
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  bot:
+    build: ./bot
+    container_name: pricemonitor-bot
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   pgdata:
+  ml-models:
