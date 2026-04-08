@@ -79,8 +79,21 @@ def buscar_pagina(url):
             title_el = item.select_one(
                 ".poly-component__title, .ui-search-item__title"
             )
-            price_el = item.select_one(".andes-money-amount__fraction")
-            cents_el = item.select_one(".andes-money-amount__cents")
+            # Preço atual: dentro de .poly-price__current
+            # Se não achar, pega o primeiro .andes-money-amount__fraction
+            current_price_container = item.select_one(".poly-price__current")
+            if current_price_container:
+                price_el = current_price_container.select_one(
+                    ".andes-money-amount__fraction"
+                )
+                cents_el = current_price_container.select_one(
+                    ".andes-money-amount__cents"
+                )
+            else:
+                price_el = item.select_one(".andes-money-amount__fraction")
+                cents_el = item.select_one(".andes-money-amount__cents")
+
+            # Preço original (riscado): dentro de <s>
             old_price_el = item.select_one(
                 "s .andes-money-amount__fraction"
             )
@@ -95,14 +108,18 @@ def buscar_pagina(url):
             if not ml_id:
                 continue
 
-            price_text = price_el.text.strip()
+            # Monta o preco: fraction (inteiro) + cents (decimal)
+            # fraction vem com ponto de milhar (ex: "1.299"), cents vem limpo (ex: "90")
+            fraction_text = price_el.text.strip().replace(".", "")  # remove ponto de milhar
             if cents_el:
-                price_text += "." + cents_el.text.strip()
-            price = parse_preco(price_text)
+                price = float(f"{fraction_text}.{cents_el.text.strip()}")
+            else:
+                price = float(fraction_text)
 
             original_price = None
             if old_price_el:
-                original_price = parse_preco(old_price_el.text.strip())
+                old_fraction = old_price_el.text.strip().replace(".", "")
+                original_price = float(old_fraction)
 
             img_url = ""
             if img_el:
