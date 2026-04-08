@@ -52,6 +52,8 @@ services:
     build: ./bot
     container_name: pricemonitor-bot
     env_file: .env
+    volumes:
+      - ml-models:/app/models
     depends_on:
       db:
         condition: service_healthy

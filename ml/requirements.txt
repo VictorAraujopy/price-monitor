@@ -1,7 +1,7 @@
 pandas==2.2.3
 numpy==2.2.4
 scikit-learn==1.6.1
-xgboost==2.1.4
+prophet==1.1.6
 psycopg2-binary==2.9.10
 joblib==1.4.2
 schedule==1.2.2

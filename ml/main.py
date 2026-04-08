@@ -3,13 +3,13 @@ import logging
 import schedule
 import time
 import psycopg2
+import psycopg2.extras
 import pandas as pd
 import numpy as np
 from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
-import xgboost as xgb
+from prophet import Prophet
 import joblib
-from datetime import datetime, timedelta
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,22 +31,24 @@ def conectar():
 
 
 def carregar_dados():
-    """Carrega histórico de preços do banco em um DataFrame."""
+    """Carrega dados do banco em DataFrame."""
     conn = conectar()
     query = """
         SELECT
             ph.product_id,
-            p.ml_id,
             p.title,
-            p.category_id,
+            p.slug,
+            p.category,
+            ph.store_name,
             ph.price,
-            ph.original_price,
-            ph.available_quantity,
-            ph.sold_quantity,
+            ph.avg_price,
+            ph.min_price,
+            ph.max_price,
+            ph.num_stores,
             ph.collected_at
         FROM price_history ph
         JOIN products p ON p.id = ph.product_id
-        ORDER BY ph.product_id, ph.collected_at
+        ORDER BY p.category, ph.product_id, ph.collected_at
     """
     df = pd.read_sql(query, conn)
     conn.close()
@@ -55,136 +57,159 @@ def carregar_dados():
 
 
 def criar_features(df):
-    """Feature engineering: cria variáveis derivadas para o ML."""
+    """Feature engineering com dados de múltiplas lojas."""
     if df.empty:
         return df
 
     df = df.copy()
     df["collected_at"] = pd.to_datetime(df["collected_at"])
 
-    # Desconto percentual
+    # Desconto em relação à média do mercado
     df["discount_pct"] = np.where(
-        df["original_price"].notna() & (df["original_price"] > 0),
-        ((df["original_price"] - df["price"]) / df["original_price"]) * 100,
+        df["avg_price"].notna() & (df["avg_price"] > 0),
+        ((df["price"] - df["avg_price"]) / df["avg_price"]) * 100,
         0,
     )
 
-    # Features temporais
-    df["hour"] = df["collected_at"].dt.hour
-    df["day_of_week"] = df["collected_at"].dt.dayofweek
-    df["day_of_month"] = df["collected_at"].dt.day
-
-    # Variação de preço por produto (em relação à coleta anterior)
-    df = df.sort_values(["product_id", "collected_at"])
-    df["price_prev"] = df.groupby("product_id")["price"].shift(1)
-    df["price_change"] = df["price"] - df["price_prev"]
-    df["price_change_pct"] = np.where(
-        df["price_prev"].notna() & (df["price_prev"] > 0),
-        (df["price_change"] / df["price_prev"]) * 100,
+    # Amplitude de preço no mercado
+    df["price_spread"] = np.where(
+        df["avg_price"].notna() & (df["avg_price"] > 0),
+        ((df["max_price"] - df["min_price"]) / df["avg_price"]) * 100,
         0,
     )
 
-    # Média móvel de preço (últimas 3 coletas)
-    df["price_ma3"] = df.groupby("product_id")["price"].transform(
-        lambda x: x.rolling(3, min_periods=1).mean()
-    )
+    # Número de lojas normalizado
+    max_stores = df["num_stores"].max()
+    df["num_stores_norm"] = df["num_stores"].fillna(1) / (max_stores if max_stores > 0 else 1)
 
-    # Razão vendas/disponível
-    df["sell_ratio"] = np.where(
-        (df["available_quantity"].notna()) & (df["available_quantity"] > 0),
-        df["sold_quantity"] / (df["available_quantity"] + df["sold_quantity"]),
-        0,
-    )
-
+    df = df.fillna(0)
     return df
 
 
-def detectar_anomalias(df):
-    """Usa Isolation Forest para detectar preços anômalos."""
+def detectar_anomalias_por_categoria(df):
+    """Isolation Forest POR CATEGORIA — compara produtos similares."""
     if len(df) < 10:
-        log.warning("Poucos dados para detecção de anomalias (%d registros)", len(df))
+        log.warning("Poucos dados para anomalias (%d registros)", len(df))
         df["anomaly"] = 0
         df["anomaly_score"] = 0.0
         return df
 
-    features = ["price", "discount_pct", "price_change_pct", "sell_ratio"]
-    X = df[features].fillna(0)
+    all_results = []
 
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+    for category, group in df.groupby("category"):
+        if len(group) < 5:
+            group = group.copy()
+            group["anomaly"] = 0
+            group["anomaly_score"] = 0.0
+            all_results.append(group)
+            continue
 
-    model = IsolationForest(
-        n_estimators=100,
-        contamination=0.05,  # espera ~5% de anomalias
-        random_state=42,
-    )
-    df["anomaly"] = model.fit_predict(X_scaled)  # 1 = normal, -1 = anomalia
-    df["anomaly_score"] = model.decision_function(X_scaled)
+        features = ["price", "discount_pct", "price_spread", "num_stores_norm"]
+        X = group[features].fillna(0)
 
-    # Salva modelos
-    joblib.dump(model, f"{MODELS_DIR}/isolation_forest.joblib")
-    joblib.dump(scaler, f"{MODELS_DIR}/scaler_anomaly.joblib")
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
 
-    n_anomalias = (df["anomaly"] == -1).sum()
-    log.info("Anomalias detectadas: %d de %d registros", n_anomalias, len(df))
+        model = IsolationForest(
+            n_estimators=100,
+            contamination=0.05,
+            random_state=42,
+        )
+        group = group.copy()
+        group["anomaly"] = model.fit_predict(X_scaled)
+        group["anomaly_score"] = model.decision_function(X_scaled)
 
-    return df
+        n_anomalias = (group["anomaly"] == -1).sum()
+        log.info("Categoria %s: %d anomalias de %d registros", category, n_anomalias, len(group))
 
+        joblib.dump(model, f"{MODELS_DIR}/isolation_forest_{category}.joblib")
+        joblib.dump(scaler, f"{MODELS_DIR}/scaler_{category}.joblib")
 
-def treinar_forecasting(df):
-    """Treina modelo XGBoost para previsão de preço."""
-    if len(df) < 20:
-        log.warning("Poucos dados para treinar forecasting (%d registros)", len(df))
-        return None
+        all_results.append(group)
 
-    feature_cols = [
-        "discount_pct",
-        "hour", "day_of_week", "day_of_month",
-        "price_change_pct", "price_ma3", "sell_ratio",
-    ]
-
-    df_train = df.dropna(subset=["price"]).copy()
-    if len(df_train) < 20:
-        log.warning("Dados insuficientes após limpeza")
-        return None
-
-    X = df_train[feature_cols].fillna(0)
-    y = df_train["price"]
-
-    model = xgb.XGBRegressor(
-        n_estimators=100,
-        max_depth=6,
-        learning_rate=0.1,
-        random_state=42,
-    )
-    model.fit(X, y)
-
-    # Salva modelo
-    joblib.dump(model, f"{MODELS_DIR}/xgb_forecast.joblib")
-    log.info("Modelo XGBoost treinado e salvo (R² treino: %.3f)", model.score(X, y))
-
-    return model
+    return pd.concat(all_results, ignore_index=True)
 
 
-def salvar_anomalias_no_banco(df):
-    """Salva anomalias detectadas em uma tabela no banco."""
-    anomalias = df[df["anomaly"] == -1].copy()
+def treinar_prophet(df):
+    """
+    Treina um modelo Prophet por produto pra previsão de preço de longo prazo.
+    Prophet precisa de pelo menos 2 pontos de dados por produto.
+    Com poucos dados, salva o que dá. Com mais dados, fica preciso.
+    """
+    df["collected_at"] = pd.to_datetime(df["collected_at"])
+
+    # Agrupa por produto: média diária do avg_price
+    produtos = df.groupby("slug").agg(
+        product_id=("product_id", "first"),
+        title=("title", "first"),
+        category=("category", "first"),
+    ).reset_index()
+
+    modelos_treinados = 0
+
+    for _, prod in produtos.iterrows():
+        slug = prod["slug"]
+
+        # Pega série temporal do preço médio desse produto
+        serie = df[df["slug"] == slug][["collected_at", "avg_price"]].copy()
+        serie = serie[serie["avg_price"] > 0]
+
+        # Prophet precisa de pelo menos 2 datas diferentes
+        serie["date"] = serie["collected_at"].dt.date
+        serie_diaria = serie.groupby("date")["avg_price"].mean().reset_index()
+        serie_diaria.columns = ["ds", "y"]
+        serie_diaria["ds"] = pd.to_datetime(serie_diaria["ds"])
+
+        if len(serie_diaria) < 2:
+            continue
+
+        try:
+            model = Prophet(
+                daily_seasonality=False,
+                weekly_seasonality=True if len(serie_diaria) >= 14 else False,
+                yearly_seasonality=False,
+                changepoint_prior_scale=0.05,
+            )
+            model.fit(serie_diaria)
+
+            # Salva modelo por produto
+            safe_slug = slug[:100].replace("/", "_")
+            joblib.dump(model, f"{MODELS_DIR}/prophet_{safe_slug}.joblib")
+            modelos_treinados += 1
+
+        except Exception as e:
+            log.warning("Erro ao treinar Prophet para %s: %s", slug[:40], e)
+            continue
+
+    log.info("Prophet: %d modelos treinados de %d produtos", modelos_treinados, len(produtos))
+
+
+def salvar_anomalias(df):
+    """Salva anomalias no banco — IF detectou E preço 10%+ abaixo da média."""
+    anomalias = df[
+        (df["anomaly"] == -1) & (df["discount_pct"] < -10)
+    ].copy()
+
     if anomalias.empty:
-        log.info("Nenhuma anomalia para salvar")
+        log.info("Nenhuma anomalia relevante para salvar")
         return
 
     conn = conectar()
     with conn.cursor() as cur:
+        cur.execute("DELETE FROM anomalies")
+
         for _, row in anomalias.iterrows():
             cur.execute("""
-                INSERT INTO anomalies (product_id, ml_id, title, price, anomaly_score)
-                VALUES (%s, %s, %s, %s, %s)
+                INSERT INTO anomalies
+                    (product_id, title, store_name, price, avg_price, discount_pct)
+                VALUES (%s, %s, %s, %s, %s, %s)
             """, (
                 int(row["product_id"]),
-                row["ml_id"],
                 row["title"],
+                row["store_name"],
                 float(row["price"]),
-                float(row["anomaly_score"]),
+                float(row["avg_price"]),
+                float(row["discount_pct"]),
             ))
 
     conn.commit()
@@ -193,27 +218,24 @@ def salvar_anomalias_no_banco(df):
 
 
 def pipeline():
-    """Executa o pipeline completo de ML."""
+    """Pipeline completo."""
     log.info("=== Iniciando pipeline ML ===")
 
-    # 1. Carregar dados
-    df = carregar_dados()
-    if df.empty:
-        log.warning("Sem dados no banco. Aguardando coletas do scraper.")
-        return
+    while True:
+        df = carregar_dados()
+        if not df.empty:
+            break
+        log.warning("Sem dados no banco. Tentando novamente em 5 min...")
+        time.sleep(300)
 
-    # 2. Feature engineering
     df = criar_features(df)
-    log.info("Features criadas: %s", list(df.columns))
+    log.info("Features criadas: %d colunas", len(df.columns))
 
-    # 3. Detecção de anomalias
-    df = detectar_anomalias(df)
+    df = detectar_anomalias_por_categoria(df)
 
-    # 4. Treinar modelo de previsão
-    treinar_forecasting(df)
+    treinar_prophet(df)
 
-    # 5. Salvar anomalias no banco
-    salvar_anomalias_no_banco(df)
+    salvar_anomalias(df)
 
     log.info("=== Pipeline ML concluído ===")
 
@@ -221,13 +243,11 @@ def pipeline():
 def main():
     os.makedirs(MODELS_DIR, exist_ok=True)
 
-    # Espera o scraper fazer pelo menos uma coleta antes de rodar
-    log.info("ML Pipeline iniciado. Aguardando 2 min para primeira coleta do scraper...")
-    time.sleep(120)
+    log.info("ML Pipeline iniciado. Aguardando 30 min para coleta do scraper...")
+    time.sleep(1800)
 
     pipeline()
 
-    # Roda o pipeline a cada 6 horas (logo após o scraper)
     intervalo = int(os.getenv("COLLECTION_INTERVAL_HOURS", "6"))
     schedule.every(intervalo).hours.do(pipeline)
     log.info("Agendado: pipeline a cada %d horas", intervalo)

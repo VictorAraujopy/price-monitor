@@ -1,6 +1,7 @@
 import psycopg2
 import os
 import re
+import random
 import requests
 from bs4 import BeautifulSoup
 import schedule
@@ -13,22 +14,33 @@ logging.basicConfig(
 )
 log = logging.getLogger("scraper")
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    )
+USER_AGENTS = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
+]
+
+CATEGORY_QUERIES = {
+    "ipad": "ipad apple",
+    "macbook": "macbook",
+    "apple-watch": "apple watch",
+    "airpods": "airpods",
+    "imac": "imac",
+    "monitores": "monitor gamer",
+    "wella-oil": "Wella Professionals Oil Reflections Oleo Capilar 100ml",
 }
 
-# Mapeia categoria -> URL de listagem no Mercado Livre
-CATEGORY_URLS = {
-    "MLB1648": "https://lista.mercadolivre.com.br/informatica/",
-    "MLB1051": "https://lista.mercadolivre.com.br/celulares-e-smartphones/",
-    "MLB1672": "https://lista.mercadolivre.com.br/informatica/monitores-e-acessorios/",
-    "MLB1694": "https://lista.mercadolivre.com.br/informatica/componentes-de-computadores/placas-de-video/",
-    "MLB1652": "https://lista.mercadolivre.com.br/informatica/tablets/iPads/",
-}
+
+def get_headers():
+    return {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+    }
 
 
 def conectar():
@@ -42,206 +54,232 @@ def conectar():
 
 
 def parse_preco(text):
-    """Converte texto de preço ('1.299' ou '599') pra float."""
+    """Converte 'R$ 1.299,90' pra float 1299.90."""
     if not text:
         return None
-    limpo = text.strip().replace(".", "").replace(",", ".")
+    match = re.search(r"R\$\s*([\d.]+,\d{2})", text)
+    if not match:
+        return None
+    limpo = match.group(1).replace(".", "").replace(",", ".")
     try:
         return float(limpo)
     except ValueError:
         return None
 
 
-def extrair_ml_id(url):
-    """Extrai o ID do produto (MLB...) da URL."""
-    match = re.search(r"(MLB-?\d+)", url)
+def extrair_slug(url):
+    """Extrai o slug do produto da URL do Buscapé."""
+    # https://www.buscape.com.br/tablet-ipad/tablet-apple-ipad-11-... -> tablet-apple-ipad-11-...
+    match = re.search(r"buscape\.com\.br/[^/]+/([^?]+)", url)
     if match:
-        return match.group(1).replace("-", "")
+        return match.group(1)[:200]
     return None
 
 
-def buscar_pagina(url):
-    """Faz scraping de uma página de listagem do Mercado Livre."""
-    produtos = []
+def buscar_links_produtos(query, max_paginas=2):
+    """Busca a listagem do Buscapé e retorna os links das páginas de produto."""
+    links = []
 
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=30)
-        resp.raise_for_status()
-    except Exception as e:
-        log.warning("Erro ao acessar %s: %s", url, e)
-        return produtos
+    for pagina in range(1, max_paginas + 1):
+        url = f"https://www.buscape.com.br/search?q={query.replace(' ', '+')}&page={pagina}"
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-    items = soup.select("li.ui-search-layout__item")
-
-    for item in items:
         try:
-            title_el = item.select_one(
-                ".poly-component__title, .ui-search-item__title"
-            )
-            # Preço atual: dentro de .poly-price__current
-            # Se não achar, pega o primeiro .andes-money-amount__fraction
-            current_price_container = item.select_one(".poly-price__current")
-            if current_price_container:
-                price_el = current_price_container.select_one(
-                    ".andes-money-amount__fraction"
-                )
-                cents_el = current_price_container.select_one(
-                    ".andes-money-amount__cents"
-                )
-            else:
-                price_el = item.select_one(".andes-money-amount__fraction")
-                cents_el = item.select_one(".andes-money-amount__cents")
-
-            # Preço original (riscado): dentro de <s>
-            old_price_el = item.select_one(
-                "s .andes-money-amount__fraction"
-            )
-            link_el = item.select_one("a[href]")
-            img_el = item.select_one("img[data-src], img[src]")
-
-            if not title_el or not price_el or not link_el:
-                continue
-
-            href = link_el.get("href", "")
-            ml_id = extrair_ml_id(href)
-            if not ml_id:
-                continue
-
-            # Monta o preco: fraction (inteiro) + cents (decimal)
-            # fraction vem com ponto de milhar (ex: "1.299"), cents vem limpo (ex: "90")
-            fraction_text = price_el.text.strip().replace(".", "")  # remove ponto de milhar
-            if cents_el:
-                price = float(f"{fraction_text}.{cents_el.text.strip()}")
-            else:
-                price = float(fraction_text)
-
-            original_price = None
-            if old_price_el:
-                old_fraction = old_price_el.text.strip().replace(".", "")
-                original_price = float(old_fraction)
-
-            img_url = ""
-            if img_el:
-                img_url = img_el.get("data-src") or img_el.get("src", "")
-
-            produtos.append({
-                "id": ml_id,
-                "title": title_el.text.strip(),
-                "price": price,
-                "original_price": original_price,
-                "permalink": href.split("?")[0],  # remove tracking params
-                "thumbnail": img_url,
-                "condition": "new",
-                "available_quantity": None,
-                "sold_quantity": None,
-            })
-
+            resp = requests.get(url, headers=get_headers(), timeout=30)
+            resp.raise_for_status()
         except Exception as e:
-            log.warning("Erro ao parsear item: %s", e)
-            continue
-
-    return produtos
-
-
-def buscar_todos_produtos(category, max_paginas=4):
-    """Busca múltiplas páginas de uma categoria."""
-    base_url = CATEGORY_URLS.get(category)
-    if not base_url:
-        log.warning("Categoria %s sem URL mapeada, pulando", category)
-        return []
-
-    todos = []
-
-    for pagina in range(max_paginas):
-        if pagina == 0:
-            url = base_url
-        else:
-            offset = pagina * 48 + 1
-            url = f"{base_url}_Desde_{offset}"
-
-        produtos = buscar_pagina(url)
-        if not produtos:
+            log.warning("Erro ao buscar listagem: %s", e)
             break
 
-        todos.extend(produtos)
-        log.info(
-            "Categoria %s, página %d: %d produtos",
-            category, pagina + 1, len(produtos),
-        )
+        soup = BeautifulSoup(resp.text, "html.parser")
+        cards = soup.select("[data-testid='product-card']")
 
-        # Pequeno delay entre páginas pra não sobrecarregar
-        time.sleep(2)
+        for card in cards:
+            link_el = card.select_one("a[href]")
+            if not link_el:
+                continue
+            href = link_el.get("href", "")
+            if "/lead" in href:
+                continue
+            if not href.startswith("http"):
+                href = "https://www.buscape.com.br" + href
+            # Remove query params
+            href = href.split("?")[0]
+            if href not in links:
+                links.append(href)
 
-    log.info("Categoria %s: %d produtos coletados no total", category, len(todos))
-    return todos
+        log.info("Query '%s', página %d: %d links coletados", query, pagina, len(cards))
+        time.sleep(random.uniform(3, 6))
+
+    return links
 
 
-def salvar_produto(conn, item, category_id):
+def coletar_produto(url):
+    """Entra na página de um produto e coleta preços de todas as lojas."""
+    try:
+        resp = requests.get(url, headers=get_headers(), timeout=30)
+        resp.raise_for_status()
+    except Exception as e:
+        log.warning("Erro ao acessar produto %s: %s", url, e)
+        return None
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    title_el = soup.select_one("h1")
+    if not title_el:
+        return None
+
+    title = title_el.text.strip()
+    slug = extrair_slug(url)
+    if not slug:
+        return None
+
+    # Imagem do produto
+    img_el = soup.select_one("[class*=Hero] img, [class*=gallery] img, .swiper img")
+    thumbnail = img_el.get("src", "") if img_el else ""
+
+    # Coleta preços de cada oferta (loja)
+    offers = soup.select("[class*=OfferCardMin_OfferCardWrapper]")
+    precos = []
+
+    for offer in offers:
+        text = offer.get_text()
+        price = parse_preco(text)
+        if price and price > 0:
+            # Tenta extrair nome da loja da imagem alt ou texto
+            store_img = offer.select_one("img")
+            store_name = "Desconhecida"
+            if store_img and store_img.get("alt"):
+                store_name = store_img.get("alt", "")[:200]
+
+            precos.append({
+                "store": store_name,
+                "price": price,
+            })
+
+    if not precos:
+        return None
+
+    # Calcula estatísticas
+    prices_list = [p["price"] for p in precos]
+    # Remove duplicatas (mesma loja aparece 2x)
+    seen = set()
+    unique_precos = []
+    for p in precos:
+        key = f"{p['store']}_{p['price']}"
+        if key not in seen:
+            seen.add(key)
+            unique_precos.append(p)
+
+    unique_prices = [p["price"] for p in unique_precos]
+    avg_price = sum(unique_prices) / len(unique_prices)
+    min_price = min(unique_prices)
+    max_price = max(unique_prices)
+
+    return {
+        "title": title,
+        "slug": slug,
+        "permalink": url,
+        "thumbnail": thumbnail,
+        "offers": unique_precos,
+        "avg_price": round(avg_price, 2),
+        "min_price": min_price,
+        "max_price": max_price,
+        "num_stores": len(unique_precos),
+    }
+
+
+def salvar_produto(conn, produto, category):
     """Insere/atualiza produto e retorna o id interno."""
     with conn.cursor() as cur:
         cur.execute("""
-            INSERT INTO products (ml_id, title, category_id, seller_id,
-                                  condition, permalink, thumbnail)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (ml_id) DO UPDATE SET
+            INSERT INTO products (slug, title, category, permalink, thumbnail)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (slug) DO UPDATE SET
                 title = EXCLUDED.title,
                 updated_at = NOW()
             RETURNING id
         """, (
-            item["id"],
-            item["title"],
-            category_id,
-            None,  # seller_id não disponível via scraping
-            item.get("condition", "new"),
-            item["permalink"],
-            item["thumbnail"],
+            produto["slug"],
+            produto["title"],
+            category,
+            produto["permalink"],
+            produto["thumbnail"],
         ))
-        product_id = cur.fetchone()[0]
-    return product_id
+        return cur.fetchone()[0]
 
 
-def salvar_preco(conn, product_id, item):
-    """Insere um registro no histórico de preços."""
+def salvar_precos(conn, product_id, produto):
+    """Salva o preço de cada loja no histórico."""
     with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO price_history
-                (product_id, price, original_price, available_quantity, sold_quantity)
-            VALUES (%s, %s, %s, %s, %s)
-        """, (
-            product_id,
-            item.get("price"),
-            item.get("original_price"),
-            item.get("available_quantity"),
-            item.get("sold_quantity"),
-        ))
+        for oferta in produto["offers"]:
+            cur.execute("""
+                INSERT INTO price_history
+                    (product_id, store_name, price, avg_price, min_price, max_price, num_stores)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (
+                product_id,
+                oferta["store"],
+                oferta["price"],
+                produto["avg_price"],
+                produto["min_price"],
+                produto["max_price"],
+                produto["num_stores"],
+            ))
 
 
 def coletar():
     """Executa uma rodada completa de coleta."""
-    categorias = os.getenv("ML_CATEGORIES", "MLB1648").split(",")
+    categorias = os.getenv(
+        "SCRAPER_CATEGORIES",
+        "ipad,macbook,apple-watch,airpods,imac,monitores,placas-de-video",
+    ).split(",")
     log.info("Iniciando coleta para categorias: %s", categorias)
 
     conn = conectar()
-    total_salvo = 0
+    total_produtos = 0
+    total_ofertas = 0
 
     try:
         for cat in categorias:
             cat = cat.strip()
-            produtos = buscar_todos_produtos(cat)
+            query = CATEGORY_QUERIES.get(cat)
+            if not query:
+                log.warning("Categoria %s sem query mapeada", cat)
+                continue
 
-            for item in produtos:
+            links = buscar_links_produtos(query)
+            log.info("Categoria %s: %d páginas de produto encontradas", cat, len(links))
+
+            for link in links:
                 try:
-                    product_id = salvar_produto(conn, item, cat)
-                    salvar_preco(conn, product_id, item)
-                    total_salvo += 1
+                    produto = coletar_produto(link)
+                    if not produto:
+                        continue
+
+                    product_id = salvar_produto(conn, produto, cat)
+                    salvar_precos(conn, product_id, produto)
+                    total_produtos += 1
+                    total_ofertas += produto["num_stores"]
+
+                    log.info(
+                        "  %s: %d lojas, R$%.2f - R$%.2f (média R$%.2f)",
+                        produto["title"][:40],
+                        produto["num_stores"],
+                        produto["min_price"],
+                        produto["max_price"],
+                        produto["avg_price"],
+                    )
+
                 except Exception as e:
-                    log.warning("Erro ao salvar produto %s: %s", item.get("id"), e)
+                    log.warning("Erro ao salvar produto: %s", e)
                     conn.rollback()
                     continue
 
+                time.sleep(random.uniform(2, 4))
+
             conn.commit()
-            log.info("Categoria %s commitada no banco", cat)
+            log.info("Categoria %s commitada", cat)
+            time.sleep(random.uniform(5, 10))
 
     except Exception as e:
         log.error("Erro na coleta: %s", e)
@@ -249,11 +287,11 @@ def coletar():
     finally:
         conn.close()
 
-    log.info("Coleta finalizada: %d registros salvos", total_salvo)
+    log.info("Coleta finalizada: %d produtos, %d ofertas", total_produtos, total_ofertas)
 
 
 def main():
-    log.info("=== Price Monitor Scraper iniciado ===")
+    log.info("=== Price Monitor Scraper iniciado (Buscape) ===")
     coletar()
 
     intervalo = int(os.getenv("COLLECTION_INTERVAL_HOURS", "6"))
